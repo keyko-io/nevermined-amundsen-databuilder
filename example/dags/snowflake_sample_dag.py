@@ -1,28 +1,33 @@
 # Copyright Contributors to the Amundsen project.
 # SPDX-License-Identifier: Apache-2.0
 
+"""
+This is a sample Airflow DAG that demos extracting metadata from Snowflake and loading it into
+Neo4j and Elasticsearch
+"""
+
 import textwrap
 from datetime import datetime, timedelta
 import uuid
 
-from elasticsearch import Elasticsearch
 from airflow import DAG  # noqa
 from airflow import macros  # noqa
 from airflow.operators.python_operator import PythonOperator  # noqa
 from pyhocon import ConfigFactory
-from databuilder.extractor.neo4j_search_data_extractor import Neo4jSearchDataExtractor
-from databuilder.extractor.athena_metadata_extractor import AthenaMetadataExtractor
+
+from elasticsearch import Elasticsearch
 from databuilder.extractor.sql_alchemy_extractor import SQLAlchemyExtractor
-from databuilder.publisher.elasticsearch_publisher import ElasticsearchPublisher
-from databuilder.extractor.neo4j_extractor import Neo4jExtractor
+from databuilder.extractor.snowflake_metadata_extractor import SnowflakeMetadataExtractor
 from databuilder.job.job import DefaultJob
-from databuilder.loader.file_system_elasticsearch_json_loader import FSElasticsearchJSONLoader
 from databuilder.loader.file_system_neo4j_csv_loader import FsNeo4jCSVLoader
 from databuilder.publisher import neo4j_csv_publisher
 from databuilder.publisher.neo4j_csv_publisher import Neo4jCsvPublisher
+from databuilder.extractor.neo4j_search_data_extractor import Neo4jSearchDataExtractor
+from databuilder.extractor.neo4j_extractor import Neo4jExtractor
+from databuilder.loader.file_system_elasticsearch_json_loader import FSElasticsearchJSONLoader
+from databuilder.publisher.elasticsearch_publisher import ElasticsearchPublisher
 from databuilder.task.task import DefaultTask
 from databuilder.transformer.base_transformer import NoopTransformer
-
 
 dag_args = {
     'concurrency': 10,
@@ -35,7 +40,7 @@ dag_args = {
 
 default_args = {
     'owner': 'amundsen',
-    'start_date': datetime(2018, 6, 18),
+    'start_date': datetime(2020, 8, 19),
     'depends_on_past': False,
     'email': [''],
     'email_on_failure': False,
@@ -47,7 +52,7 @@ default_args = {
 }
 
 # NEO4J cluster endpoints
-NEO4J_ENDPOINT = 'bolt://127.0.0.1:7687'
+NEO4J_ENDPOINT = 'bolt://neo4j:7687'
 
 neo4j_endpoint = NEO4J_ENDPOINT
 
@@ -55,31 +60,35 @@ neo4j_user = 'neo4j'
 neo4j_password = 'test'
 
 es = Elasticsearch([
-    {'host': '127.0.0.1'},
+    {'host': 'elasticsearch'},
 ])
 
+
 # TODO: user provides a list of schema for indexing
-SUPPORTED_SCHEMAS = ['sampledb']
-# String format - ('schema1', schema2', .... 'schemaN')
+SUPPORTED_SCHEMAS = ['public']
 SUPPORTED_SCHEMA_SQL_IN_CLAUSE = "('{schemas}')".format(schemas="', '".join(SUPPORTED_SCHEMAS))
 
-
-OPTIONAL_TABLE_NAMES = ''
-AWS_ACCESS = 'YOUR_ACCESS_KEY'
-AWS_SECRET = 'YOUR_SECRET_KEY'
+# SNOWFLAKE CONFIGs
+SNOWFLAKE_DATABASE_KEY = 'YOUR_SNOWFLAKE_DB_NAME'
 
 
+# todo: connection string needs to change
 def connection_string():
-    access_key = AWS_ACCESS
-    secret = AWS_SECRET
-    host = 'athena.us-east-1.amazonaws.com'
-    extras = 's3_staging_dir=s3://aws-athena-query-results-032106861074-us-east-1/'
-    return "awsathena+rest://%s:%s@%s:443/?%s" % (access_key, secret, host, extras)
+    user = 'username'
+    password = 'password'
+    account = 'YourSnowflakeAccountHere'
+    return "snowflake://%s:%s@%s" % (user, password, account)
 
 
-def create_table_extract_job():
+def create_snowflake_table_metadata_job():
+    """
+    Launches databuilder job that extracts table and column metadata from Snowflake database and publishes
+    to Neo4j.
+    """
+
     where_clause_suffix = textwrap.dedent("""
-        where table_schema in {schemas}
+            WHERE c.TABLE_SCHEMA IN {schemas}
+            AND lower(c.COLUMN_NAME) not like 'dw_%';
     """).format(schemas=SUPPORTED_SCHEMA_SQL_IN_CLAUSE)
 
     tmp_folder = '/var/tmp/amundsen/table_metadata'
@@ -87,11 +96,12 @@ def create_table_extract_job():
     relationship_files_folder = '{tmp_folder}/relationships/'.format(tmp_folder=tmp_folder)
 
     job_config = ConfigFactory.from_dict({
-        'extractor.athena_metadata.{}'.format(AthenaMetadataExtractor.WHERE_CLAUSE_SUFFIX_KEY):
-            where_clause_suffix,
-        'extractor.athena_metadata.extractor.sqlalchemy.{}'.format(SQLAlchemyExtractor.CONN_STRING):
+        'extractor.snowflake.extractor.sqlalchemy.{}'.format(SQLAlchemyExtractor.CONN_STRING):
             connection_string(),
-        'extractor.athena_metadata.{}'.format(AthenaMetadataExtractor.CATALOG_KEY): "'AwsDataCatalog'",
+        'extractor.snowflake.{}'.format(SnowflakeMetadataExtractor.SNOWFLAKE_DATABASE_KEY):
+            SNOWFLAKE_DATABASE_KEY,
+        'extractor.snowflake.{}'.format(SnowflakeMetadataExtractor.WHERE_CLAUSE_SUFFIX_KEY):
+            where_clause_suffix,
         'loader.filesystem_csv_neo4j.{}'.format(FsNeo4jCSVLoader.NODE_DIR_PATH):
             node_files_folder,
         'loader.filesystem_csv_neo4j.{}'.format(FsNeo4jCSVLoader.RELATION_DIR_PATH):
@@ -107,16 +117,21 @@ def create_table_extract_job():
         'publisher.neo4j.{}'.format(neo4j_csv_publisher.NEO4J_PASSWORD):
             neo4j_password,
         'publisher.neo4j.{}'.format(neo4j_csv_publisher.JOB_PUBLISH_TAG):
-            'unique_tag',  # should use unique tag here like {ds}
+            'some_unique_tag'  # TO-DO unique tag must be added
     })
+
     job = DefaultJob(conf=job_config,
-                     task=DefaultTask(extractor=AthenaMetadataExtractor(), loader=FsNeo4jCSVLoader(),
-                                      transformer=NoopTransformer()),
+                     task=DefaultTask(extractor=SnowflakeMetadataExtractor(), loader=FsNeo4jCSVLoader()),
                      publisher=Neo4jCsvPublisher())
     job.launch()
 
 
-def create_es_publisher_sample_job():
+def create_snowflake_es_publisher_job():
+    """
+    Launches databuilder job that extracts data from Neo4J backend and pushes them as search documents
+    to Elasticsearch index
+    """
+
     # loader saves data to this location and publisher reads it from here
     extracted_search_data_path = '/var/tmp/amundsen/search_data.json'
 
@@ -134,17 +149,22 @@ def create_es_publisher_sample_job():
     elasticsearch_index_alias = 'table_search_index'
 
     job_config = ConfigFactory.from_dict({
-        'extractor.search_data.extractor.neo4j.{}'.format(Neo4jExtractor.GRAPH_URL_CONFIG_KEY): neo4j_endpoint,
+        'extractor.search_data.extractor.neo4j.{}'.format(Neo4jExtractor.GRAPH_URL_CONFIG_KEY):
+            neo4j_endpoint,
         'extractor.search_data.extractor.neo4j.{}'.format(Neo4jExtractor.MODEL_CLASS_CONFIG_KEY):
             'databuilder.models.table_elasticsearch_document.TableESDocument',
-        'extractor.search_data.extractor.neo4j.{}'.format(Neo4jExtractor.NEO4J_AUTH_USER): neo4j_user,
-        'extractor.search_data.extractor.neo4j.{}'.format(Neo4jExtractor.NEO4J_AUTH_PW): neo4j_password,
+        'extractor.search_data.extractor.neo4j.{}'.format(Neo4jExtractor.NEO4J_AUTH_USER):
+            neo4j_user,
+        'extractor.search_data.extractor.neo4j.{}'.format(Neo4jExtractor.NEO4J_AUTH_PW):
+            neo4j_password,
         'loader.filesystem.elasticsearch.{}'.format(FSElasticsearchJSONLoader.FILE_PATH_CONFIG_KEY):
             extracted_search_data_path,
-        'loader.filesystem.elasticsearch.{}'.format(FSElasticsearchJSONLoader.FILE_MODE_CONFIG_KEY): 'w',
+        'loader.filesystem.elasticsearch.{}'.format(FSElasticsearchJSONLoader.FILE_MODE_CONFIG_KEY):
+            'w',
         'publisher.elasticsearch.{}'.format(ElasticsearchPublisher.FILE_PATH_CONFIG_KEY):
             extracted_search_data_path,
-        'publisher.elasticsearch.{}'.format(ElasticsearchPublisher.FILE_MODE_CONFIG_KEY): 'r',
+        'publisher.elasticsearch.{}'.format(ElasticsearchPublisher.FILE_MODE_CONFIG_KEY):
+            'r',
         'publisher.elasticsearch.{}'.format(ElasticsearchPublisher.ELASTICSEARCH_CLIENT_CONFIG_KEY):
             elasticsearch_client,
         'publisher.elasticsearch.{}'.format(ElasticsearchPublisher.ELASTICSEARCH_NEW_INDEX_CONFIG_KEY):
@@ -162,15 +182,16 @@ def create_es_publisher_sample_job():
 
 
 with DAG('amundsen_databuilder', default_args=default_args, **dag_args) as dag:
-    athena_table_extract_job = PythonOperator(
-        task_id='athena_table_extract_job',
-        python_callable=create_table_extract_job
+
+    snowflake_table_metadata_job = PythonOperator(
+        task_id='snowflake_table_metadata_extract_job',
+        python_callable=create_snowflake_table_metadata_job
     )
 
-    athena_es_publisher_job = PythonOperator(
-        task_id='athena_es_publisher_job',
-        python_callable=create_es_publisher_sample_job
+    snowflake_es_publisher_job = PythonOperator(
+        task_id='snowflake_es_publisher_job',
+        python_callable=create_snowflake_es_publisher_job
     )
 
     # elastic search update run after table metadata has been updated
-    athena_table_extract_job >> athena_es_publisher_job
+    snowflake_table_metadata_job >> snowflake_es_publisher_job
